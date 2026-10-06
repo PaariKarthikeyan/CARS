@@ -1,0 +1,7 @@
+Source: NASA POWER
+Parameter: PRECTOTCORR
+Latitude: 13.0827
+Longitude: 80.2707
+Temporal resolution: Daily
+Unit: mm/day
+Date downloaded: YYYY-MM-DD

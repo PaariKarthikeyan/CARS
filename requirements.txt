@@ -1,0 +1,16 @@
+pandas
+numpy
+geopandas
+rasterio
+rasterstats
+shapely
+pyogrio
+osmnx
+networkx
+scikit-learn
+xgboost
+folium
+streamlit
+streamlit-folium
+joblib
+matplotlib

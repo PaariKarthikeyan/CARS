@@ -1,0 +1,34 @@
+# Python bytecode and local test/type-check caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.docx
+
+# Local Python environments and secrets
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Generated geospatial/API cache files
+/cache/
+*.aux.xml
+*.ovr
+*.lock
+
+# Local application and tool state
+.streamlit/secrets.toml
+.vscode/*
+
+# Operating-system files and logs
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log

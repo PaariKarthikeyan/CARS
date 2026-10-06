@@ -1,0 +1,7 @@
+Source: OpenCity.in Chennai Flooding Data
+Files:
+- Chennai Flooding Points in 2015
+- Chennai Inundation Points with Depth
+- Chennai Flood Hazard Zones Map
+Format: KML
+Date downloaded: YYYY-MM-DD
