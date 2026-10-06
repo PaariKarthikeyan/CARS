@@ -13,10 +13,14 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # ==========================================
-# PAGE CONFIGURATION
+# PAGE CONFIGURATION & STATE
 # ==========================================
 st.set_page_config(page_title="CARS: Chennai Accessibility & Risk System", layout="wide")
 st.title("CARS: Chennai Accessibility & Risk System")
+
+# Initialize session state for real-time crowdsourced flood reports
+if 'user_reports' not in st.session_state:
+    st.session_state.user_reports = []
 
 # ==========================================
 # CACHED DATA LOADING
@@ -41,20 +45,21 @@ def load_hotspots():
 def load_road_graph():
     G = ox.load_graphml(Path("data/processed/roads/chennai_roads_risk.graphml"))
     
-    # Heavy exponential penalty for any road with flood probability > 1%
+    # PROPORTIONAL PENALTY FIX: 
+    # Instead of a flat addition, we multiply the length by the risk severity.
+    # This ensures a 10m puddle isn't penalized as harshly as a 5km flooded highway.
     for u, v, k, data in G.edges(keys=True, data=True):
         length = float(data.get('length', 100.0))
         prob = float(data.get('flood_prob', 0.0))
         
-        # A penalty is applied, but the road is never deleted. This guarantees
-        # that if a risky road is the ONLY way, the algorithm will still take it.
         if prob > 0.01:
-            penalty = 15000 + (prob * 75000)
+            # A road with 50% flood risk will 'feel' 26x longer to the algorithm
+            multiplier = 1 + (prob * 50.0) 
+            data['risk_adjusted_length'] = length * multiplier
         else:
-            penalty = prob * 10.0
+            data['risk_adjusted_length'] = length
             
         data['length'] = length
-        data['risk_adjusted_length'] = length + penalty
         data['flood_prob'] = prob
         
     return G
@@ -63,7 +68,6 @@ def load_road_graph():
 def load_safe_institutions(_grid_gdf):
     """Loads cleaned offline institutions and filters for zero-risk zones."""
     inst_path = Path("data/processed/institutions/chennai_institutions_cleaned.geojson")
-    
     if not inst_path.exists():
         return gpd.GeoDataFrame()
         
@@ -85,7 +89,7 @@ with st.spinner("Loading geospatial network, AI models, and Safe Institutions...
     rf_model = load_model()
     grid_gdf = load_grid()
     hotspots_gdf = load_hotspots()
-    G = load_road_graph()
+    G_base = load_road_graph()
     
     features = [
         'elevation_mean', 'slope_mean', 'rainfall_24h', 'rainfall_72h', 
@@ -94,14 +98,36 @@ with st.spinner("Loading geospatial network, AI models, and Safe Institutions...
     ]
     X = grid_gdf[features].fillna(0)
     grid_gdf['flood_prob'] = rf_model.predict_proba(X)[:, 1]
-    
     safe_institutions_gdf = load_safe_institutions(grid_gdf)
 
 # ==========================================
-# GEOGRAPHIC UTILITIES & DISTANCE CALCULATION
+# REAL-TIME GRAPH MODIFICATION
+# ==========================================
+def apply_user_reports_to_graph(G, reports):
+    """Creates a temporary graph where user-reported nodes are impassable."""
+    if not reports:
+        return G
+    
+    G_active = G.copy()
+    for lat, lon in reports:
+        # Snap the user's click to the nearest road intersection
+        blocked_node = ox.distance.nearest_nodes(G_active, lon, lat)
+        
+        # Apply an infinite penalty to all roads connecting to this intersection
+        for u, v, k, data in G_active.edges(blocked_node, data=True, keys=True):
+            data['risk_adjusted_length'] = 99999999.0
+        for u, v, k, data in G_active.in_edges(blocked_node, data=True, keys=True):
+            data['risk_adjusted_length'] = 99999999.0
+            
+    return G_active
+
+# Generate the active graph for this session
+G = apply_user_reports_to_graph(G_base, st.session_state.user_reports)
+
+# ==========================================
+# GEOGRAPHIC UTILITIES & ROUTING
 # ==========================================
 def haversine_dist_km(lat1, lon1, lat2, lon2):
-    """Calculates great-circle distance between two coordinates in kilometers."""
     R = 6371.0
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
@@ -109,11 +135,7 @@ def haversine_dist_km(lat1, lon1, lat2, lon2):
          math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2)
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-def find_best_evacuation_center(G, orig_node, start_lat, start_lon, max_radius_km=7.0):
-    """
-    Finds a 0-risk evacuation institution prioritizing within 5-7 km.
-    If none are reachable, falls back to the nearest reachable safe center anywhere.
-    """
+def find_best_evacuation_center(G_active, orig_node, start_lat, start_lon, max_radius_km=7.0):
     if safe_institutions_gdf is None or safe_institutions_gdf.empty:
         candidates = grid_gdf[grid_gdf['flood_prob'] <= 0.01].copy().reset_index(drop=True)
         if candidates.empty:
@@ -132,48 +154,43 @@ def find_best_evacuation_center(G, orig_node, start_lat, start_lon, max_radius_k
         axis=1
     )
 
-    # Get all nodes reachable from the starting position
-    lengths, paths = nx.single_source_dijkstra(G, orig_node, weight='risk_adjusted_length')
-
-    # Try to find a center within the radius that is actually reachable
+    # Calculate actual road distance to all reachable nodes avoiding user-reported blockages
+    lengths, paths = nx.single_source_dijkstra(G_active, orig_node, weight='risk_adjusted_length')
     nearby_candidates = candidates[candidates['dist_km'] <= max_radius_km].copy()
     
     best_center = None
     lowest_cost = float('inf')
 
-    # 1. Evaluate centers within 7km
+    # Priority 1: Centers within 7km
     for _, row in nearby_candidates.iterrows():
         cand_lat = float(row['target_lat'])
         cand_lon = float(row['target_lon'])
-        dest_node = ox.distance.nearest_nodes(G, cand_lon, cand_lat)
+        dest_node = ox.distance.nearest_nodes(G_active, cand_lon, cand_lat)
 
-        if dest_node in lengths:
-            if lengths[dest_node] < lowest_cost:
+        if dest_node in lengths and lengths[dest_node] < lowest_cost:
+            lowest_cost = lengths[dest_node]
+            best_center = {
+                "lat": cand_lat, "lon": cand_lon, "name": str(row['display_name']),
+                "prob": float(row.get('flood_prob', 0.0)), "dest_node": dest_node,
+                "route": paths[dest_node], "crow_dist_km": float(row['dist_km']),
+                "fallback_used": False
+            }
+
+    # Priority 2: Closest reachable safe center anywhere if 7km radius is blocked
+    if best_center is None:
+        for _, row in candidates.iterrows():
+            cand_lat = float(row['target_lat'])
+            cand_lon = float(row['target_lon'])
+            dest_node = ox.distance.nearest_nodes(G_active, cand_lon, cand_lat)
+
+            if dest_node in lengths and lengths[dest_node] < lowest_cost:
                 lowest_cost = lengths[dest_node]
                 best_center = {
                     "lat": cand_lat, "lon": cand_lon, "name": str(row['display_name']),
                     "prob": float(row.get('flood_prob', 0.0)), "dest_node": dest_node,
                     "route": paths[dest_node], "crow_dist_km": float(row['dist_km']),
-                    "fallback_used": False
+                    "fallback_used": True
                 }
-
-    # 2. GUARANTEED FALLBACK: If no centers within 7km are physically reachable, 
-    # ignore the radius and route to the closest safe center that IS reachable.
-    if best_center is None:
-        for _, row in candidates.iterrows():
-            cand_lat = float(row['target_lat'])
-            cand_lon = float(row['target_lon'])
-            dest_node = ox.distance.nearest_nodes(G, cand_lon, cand_lat)
-
-            if dest_node in lengths:
-                if lengths[dest_node] < lowest_cost:
-                    lowest_cost = lengths[dest_node]
-                    best_center = {
-                        "lat": cand_lat, "lon": cand_lon, "name": str(row['display_name']),
-                        "prob": float(row.get('flood_prob', 0.0)), "dest_node": dest_node,
-                        "route": paths[dest_node], "crow_dist_km": float(row['dist_km']),
-                        "fallback_used": True
-                    }
 
     return best_center
 
@@ -211,22 +228,22 @@ st.sidebar.header("Navigation Panel")
 
 with st.sidebar.form("routing_form"):
     start_loc = st.selectbox("Start Location", list(LOCATIONS.keys()), index=list(LOCATIONS.keys()).index("T Nagar"))
-    
-    routing_mode = st.radio(
-        "Routing Goal", 
-        ["Navigate to Specific Destination", "Find Nearest Safe Evacuation Center (Within 5-7 km)"]
-    )
-    
+    routing_mode = st.radio("Routing Goal", ["Navigate to Specific Destination", "Find Nearest Safe Evacuation Center (Within 5-7 km)"])
     end_loc = st.selectbox("Destination (Used for Specific Destination Mode)", list(LOCATIONS.keys()), index=list(LOCATIONS.keys()).index("Velachery"))
-    
     route_type = st.radio("Route Preference", ["Lower-Risk Route (Safer)", "Shortest Distance"])
-    
     calculate_btn = st.form_submit_button("Calculate Route")
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("Real-Time Incident Reporting")
+st.sidebar.info("Click anywhere on the map to report a live flood. The routing engine will instantly block that road and reroute you.")
+if st.sidebar.button("Clear All User Flood Reports"):
+    st.session_state.user_reports = []
+    st.rerun()
+
 # ==========================================
-# SECTION 1: MAP & ROUTING RESULTS
+# SECTION 1: ROUTING LOGIC EXECUTION
 # ==========================================
-st.header("1. Interactive Map & Routing Results")
+st.header("1. Interactive Map & Live Routing Results")
 
 route_coords = []
 route_stats = {"distance_km": 0.0, "high_risk_segments": 0}
@@ -239,18 +256,15 @@ if calculate_btn:
     orig_node = ox.distance.nearest_nodes(G, start_lon, start_lat)
 
     if "Evacuation Center" in routing_mode:
-        st.info("Locating 0% risk schools/colleges within 5-7 km and computing safest approach path...")
+        st.info("Locating 0% risk safe zones and computing path avoiding user-reported blockages...")
         best_evac = find_best_evacuation_center(G, orig_node, start_lat, start_lon, max_radius_km=7.0)
 
         if best_evac:
             if best_evac["fallback_used"]:
-                st.warning(f"No fully safe route exists within 7km. Expanding search and routing to the closest accessible safe zone: {best_evac['name']}.")
-            actual_end_lat = best_evac["lat"]
-            actual_end_lon = best_evac["lon"]
-            evac_name = best_evac["name"]
-            evac_crow_dist = best_evac["crow_dist_km"]
-            route = best_evac["route"]
-            dest_node = best_evac["dest_node"]
+                st.warning(f"No safe route exists within 7km. Routing to closest accessible safe zone: {best_evac['name']}.")
+            actual_end_lat, actual_end_lon = best_evac["lat"], best_evac["lon"]
+            evac_name, evac_crow_dist = best_evac["name"], best_evac["crow_dist_km"]
+            route, dest_node = best_evac["route"], best_evac["dest_node"]
         else:
             route = None
             st.error("Severe Network Issue: No safe zones are accessible from this starting location.")
@@ -259,39 +273,16 @@ if calculate_btn:
         dest_node = ox.distance.nearest_nodes(G, actual_end_lon, actual_end_lat)
         weight = 'risk_adjusted_length' if route_type == "Lower-Risk Route (Safer)" else 'length'
         
-        # GUARANTEED ROUTING LOGIC FOR DESTINATIONS
         try:
             route = nx.shortest_path(G, orig_node, dest_node, weight=weight)
         except nx.NetworkXNoPath:
-            # Fallback: Destination is disconnected from the start node.
-            # We map all reachable nodes and find the one closest to the destination.
-            reachable_nodes = nx.single_source_dijkstra_path_length(G, orig_node, weight=weight)
-            
-            best_node = None
-            min_dist = float('inf')
-            
-            for n in reachable_nodes.keys():
-                dist = haversine_dist_km(actual_end_lat, actual_end_lon, G.nodes[n]['y'], G.nodes[n]['x'])
-                if dist < min_dist:
-                    min_dist = dist
-                    best_node = n
-                    
-            if best_node:
-                route = nx.shortest_path(G, orig_node, best_node, weight=weight)
-                dest_node = best_node
-                
-                # Update actual end coordinates so the marker sits at the reachable end-point
-                actual_end_lat = G.nodes[best_node]['y']
-                actual_end_lon = G.nodes[best_node]['x']
-                st.warning("The exact destination is located on a disconnected road network. Routing you to the closest accessible point instead.")
-            else:
-                route = None
+            route = None
+            st.error(f"Cannot find a path to {end_loc}. The destination is entirely blocked by user reports or disconnected.")
 
+    # Calculate final route statistics
     if actual_end_lat is not None and start_lat == actual_end_lat and start_lon == actual_end_lon:
-        st.warning("Start location and destination are identical, or you are already at this designated safe facility!")
-    elif route is None:
-        st.error("No traversable route found between these locations on the active road network.")
-    else:
+        st.warning("Start location and destination are identical.")
+    elif route:
         dist_m = 0
         for u, v in zip(route[:-1], route[1:]):
             edge_dict = G[u][v]
@@ -309,91 +300,82 @@ if calculate_btn:
         route_stats["distance_km"] = dist_m / 1000
 
         st.success("Optimal route calculated successfully!")
-
         col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("Total Road Distance", f"{route_stats['distance_km']:.2f} km")
         with col2:
-            st.metric("Risky Segments Crossed (>1% Risk)", route_stats['high_risk_segments'],
-                      delta="Avoided (0 Risky Segments)" if route_stats['high_risk_segments'] == 0 else "Avoid if Possible",
-                      delta_color="inverse")
+            st.metric("Risky Segments Crossed", route_stats['high_risk_segments'],
+                      delta="Avoided!" if route_stats['high_risk_segments'] == 0 else "Avoid if Possible", delta_color="inverse")
         with col3:
             if "Evacuation Center" in routing_mode:
-                st.metric("Safe Evacuation Center", f"{evac_name}", 
-                          delta=f"{evac_crow_dist:.1f} km direct distance", delta_color="normal")
+                st.metric("Safe Evacuation Center", f"{evac_name}", delta=f"{evac_crow_dist:.1f} km direct", delta_color="normal")
             else:
                 st.metric("Destination", f"{end_loc}")
 else:
-    st.info("Select your starting point and desired route type in the sidebar, then click 'Calculate Route'.")
+    st.info("Select your starting point in the sidebar and click 'Calculate Route'. Click on the map below to report live blockages.")
 
-# Initialize Folium Map
+# ==========================================
+# MAP GENERATION & INTERACTION
+# ==========================================
 m = folium.Map(location=[13.05, 80.23], zoom_start=11, tiles="OpenStreetMap")
 
-# Render Flood Risk Grid
+# Render AI Flood Prediction Grid
 grid_map = grid_gdf[grid_gdf['flood_prob'] > 0.2].copy()
 grid_map['geometry'] = grid_map.geometry.simplify(0.001)
-
 folium.Choropleth(
     geo_data=json.loads(grid_map[['cell_id', 'geometry']].to_json()),
-    data=grid_map,
-    columns=['cell_id', 'flood_prob'],
-    key_on='feature.properties.cell_id',
-    fill_color='YlOrRd',
-    fill_opacity=0.45,
-    line_opacity=0.1,
-    legend_name='Predicted Flood Probability'
+    data=grid_map, columns=['cell_id', 'flood_prob'],
+    key_on='feature.properties.cell_id', fill_color='YlOrRd',
+    fill_opacity=0.45, line_opacity=0.1, legend_name='Predicted Flood Probability'
 ).add_to(m)
 
-# Render Historical Hotspots
-if hotspots_gdf is not None:
-    for _, row in hotspots_gdf.iterrows():
-        folium.CircleMarker(
-            location=[row.geometry.y, row.geometry.x],
-            radius=3,
-            color='blue',
-            fill=True,
-            fill_opacity=0.6,
-            tooltip=f"Historical Hotspot (Cluster {row.get('cluster_id', 'N/A')})"
-        ).add_to(m)
-
-# Render Path and Waypoint Markers
+# Render Path and Waypoints
 if route_coords:
     route_color = "green" if (route_type == "Lower-Risk Route (Safer)" or "Evacuation Center" in routing_mode) else "red"
     folium.PolyLine(route_coords, color=route_color, weight=6, opacity=0.85).add_to(m)
-    
-    folium.Marker(LOCATIONS[start_loc], tooltip=f"Start: {start_loc}", icon=folium.Icon(color="gray", icon="play")).add_to(m)
-    
-    if "Evacuation Center" in routing_mode and actual_end_lat is not None:
-        folium.Marker(
-            [actual_end_lat, actual_end_lon], 
-            tooltip=f"Evacuation Center: {evac_name}", 
-            icon=folium.Icon(color="green", icon="info-sign")
-        ).add_to(m)
-    elif actual_end_lat is not None:
-        folium.Marker(
-            [actual_end_lat, actual_end_lon], 
-            tooltip=f"Destination: {end_loc}", 
-            icon=folium.Icon(color="red", icon="flag")
-        ).add_to(m)
+    if start_loc in LOCATIONS:
+        folium.Marker(LOCATIONS[start_loc], tooltip=f"Start: {start_loc}", icon=folium.Icon(color="gray", icon="play")).add_to(m)
+    if actual_end_lat is not None:
+        icon_color = "green" if "Evacuation Center" in routing_mode else "red"
+        icon_type = "info-sign" if "Evacuation Center" in routing_mode else "flag"
+        tooltip_txt = f"Evacuation: {evac_name}" if "Evacuation Center" in routing_mode else f"Destination: {end_loc}"
+        folium.Marker([actual_end_lat, actual_end_lon], tooltip=tooltip_txt, icon=folium.Icon(color=icon_color, icon=icon_type)).add_to(m)
 
-st_folium(m, width="100%", height=520, returned_objects=[])
+# Render User-Reported Real-Time Blockages
+for lat, lon in st.session_state.user_reports:
+    folium.Marker(
+        [lat, lon], 
+        icon=folium.Icon(color="black", icon="ban-circle"),
+        tooltip="User Reported Live Flood (Road Blocked)"
+    ).add_to(m)
+
+# Render map and catch user clicks for real-time reporting
+map_data = st_folium(m, width="100%", height=520, returned_objects=["last_clicked"])
+
+# Process map clicks to add new flood reports
+if map_data and map_data.get("last_clicked"):
+    clicked_lat = map_data["last_clicked"]["lat"]
+    clicked_lon = map_data["last_clicked"]["lng"]
+    new_report = (clicked_lat, clicked_lon)
+    
+    # Prevent infinite loop of appending the same click
+    if new_report not in st.session_state.user_reports:
+        st.session_state.user_reports.append(new_report)
+        st.rerun()
 
 # ==========================================
 # SECTION 2: DATA VISUALIZATION GRAPHS
 # ==========================================
 st.markdown("---")
 st.header("2. Geospatial & Model Data Analytics")
-st.write("Diagnostic insights into spatial indicators, terrain features, and machine learning feature importance.")
 
 col_graph1, col_graph2 = st.columns(2)
-
 with col_graph1:
     st.subheader("Random Forest Feature Importance")
     importances = pd.Series(rf_model.feature_importances_, index=features).sort_values(ascending=True)
     fig1, ax1 = plt.subplots(figsize=(8, 4.8))
     importances.plot(kind='barh', color='teal', ax=ax1)
     ax1.set_xlabel("Importance Metric")
-    ax1.set_ylabel("Geospatial Variable")
     st.pyplot(fig1)
 
 with col_graph2:
@@ -401,19 +383,15 @@ with col_graph2:
     fig2, ax2 = plt.subplots(figsize=(8, 4.8))
     sns.histplot(grid_gdf['flood_prob'], bins=25, kde=True, color='crimson', ax=ax2)
     ax2.set_xlabel("Predicted Probability")
-    ax2.set_ylabel("Cell Count")
     st.pyplot(fig2)
 
 st.markdown("<br>", unsafe_allow_html=True)
-
 col_graph3, col_graph4 = st.columns(2)
-
 with col_graph3:
     st.subheader("Distance to Water vs. Flood Risk")
     fig3, ax3 = plt.subplots(figsize=(8, 4.8))
     sns.scatterplot(data=grid_gdf, x='distance_to_water_m', y='flood_prob', alpha=0.25, color="navy", ax=ax3)
     ax3.set_xlabel("Distance to Water (m)")
-    ax3.set_ylabel("Predicted Risk")
     st.pyplot(fig3)
 
 with col_graph4:
@@ -421,5 +399,4 @@ with col_graph4:
     fig4, ax4 = plt.subplots(figsize=(8, 4.8))
     sns.scatterplot(data=grid_gdf, x='elevation_mean', y='flood_prob', alpha=0.25, color="darkorange", ax=ax4)
     ax4.set_xlabel("Mean Elevation (m)")
-    ax4.set_ylabel("Predicted Risk")
     st.pyplot(fig4)
