@@ -8,7 +8,7 @@ __pycache__/
 .coverage
 .coverage.*
 htmlcov/
-.docx
+*.docx
 
 # Local Python environments and secrets
 .venv/
