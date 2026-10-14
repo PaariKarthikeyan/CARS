@@ -376,6 +376,22 @@ def load_safe_institutions(_grid_gdf):
     safe_pois = safe_pois.reset_index(drop=True)
     return safe_pois[['name', 'block_no', 'flood_prob', 'geometry']]
 
+@st.cache_data
+def load_all_institutions(_grid_gdf):
+    inst_path = Path("data/processed/institutions/chennai_institutions_cleaned.geojson")
+    if not inst_path.exists():
+        return gpd.GeoDataFrame()
+    pois = gpd.read_file(inst_path, engine="pyogrio")
+    if pois.empty:
+        return gpd.GeoDataFrame()
+    if pois.crs != _grid_gdf.crs:
+        pois = pois.to_crs(_grid_gdf.crs)
+    joined = gpd.sjoin(pois, _grid_gdf[['cell_id', 'block_no', 'flood_prob', 'geometry']], how='left')
+    joined = joined[~joined.index.duplicated(keep='first')].copy()
+    joined['flood_prob'] = joined['flood_prob'].fillna(0.0)
+    joined['block_no'] = joined['block_no'].fillna(-1).astype(int)
+    return joined
+
 
 # ── Clean, unobtrusive loading spinner ──
 with st.spinner("Initialising geospatial graph network and AI models..."):
@@ -393,6 +409,7 @@ with st.spinner("Initialising geospatial graph network and AI models..."):
     X = grid_gdf[FEATURES].fillna(0)
     grid_gdf['flood_prob'] = rf_model.predict_proba(X)[:, 1]
     safe_institutions_gdf = load_safe_institutions(grid_gdf)
+    all_institutions_gdf = load_all_institutions(grid_gdf)
 
 
 # ─────────────────────────────────────────
@@ -695,6 +712,10 @@ if st.session_state.blocked_blocks:
 else:
     st.sidebar.info("No active road closures reported.")
 
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🗺️ Map Display Layers")
+st.sidebar.caption("Toggle layers directly above the map canvas to show or hide AI risk zones, landmark nodes, institutions/shelters, hazard closures, and historical hotspots.")
+
 
 # ─────────────────────────────────────────
 # LIVE HAZARD BANNER
@@ -844,44 +865,84 @@ else:
 
 
 # ─────────────────────────────────────────
+# MAP DISPLAY TOGGLES & VISIBILITY CONTROLS
+# ─────────────────────────────────────────
+st.markdown("---")
+st.markdown("""
+<div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+    <div style="font-size: 1.15rem; font-weight: 700; color: #f1f5f9; display: flex; align-items: center; gap: 8px;">
+        <span>🗺️</span> Map Display Layers &amp; Overlays
+    </div>
+    <div style="font-size: 0.80rem; color: #94a3b8; font-family: 'JetBrains Mono', monospace;">
+        Toggle active layers on the geospatial map
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+col_t1, col_t2, col_t3, col_t4, col_t5 = st.columns(5)
+with col_t1:
+    show_risk_zones = st.toggle("🌊 Risk Zones", value=True, key="toggle_risk_zones",
+                                help="AI predicted flood inundation probability choropleth heatmap")
+with col_t2:
+    show_landmarks = st.toggle("📍 Node Points", value=True, key="toggle_landmarks",
+                               help="Landmark points, numbered road network blocks, and localities")
+with col_t3:
+    show_institutions = st.toggle("🏫 Institutions", value=True, key="toggle_institutions",
+                                  help="Colleges, universities, schools, and emergency safe shelters")
+with col_t4:
+    show_blocked = st.toggle("⛔ Hazard Closures", value=True, key="toggle_blocked",
+                             help="Real-time user-reported flooded sectors and impassable roads")
+with col_t5:
+    show_hotspots = st.toggle("⚠️ Historical Hotspots", value=False, key="toggle_hotspots",
+                              help="Recorded flood hotspot locations across Chennai")
+
+
+# ─────────────────────────────────────────
 # MAP VISUALISATION
 # ─────────────────────────────────────────
-m = folium.Map(location=[13.05, 80.23], zoom_start=11, tiles="OpenStreetMap")
+m = folium.Map(location=[13.05, 80.23], zoom_start=11, tiles=None)
 
-# Add alternative map tile layers
-folium.TileLayer('CartoDB positron', name='Clean Light').add_to(m)
-folium.TileLayer('CartoDB dark_matter', name='Dark Mode').add_to(m)
+# Add map base tile layers (OpenStreetMap set as default)
+folium.TileLayer('OpenStreetMap', name='OpenStreetMap', control=True, show=True).add_to(m)
+folium.TileLayer('CartoDB positron', name='Clean Light', control=True, show=False).add_to(m)
+folium.TileLayer('CartoDB dark_matter', name='Dark Mode', control=True, show=False).add_to(m)
 
-grid_map              = grid_gdf[grid_gdf['flood_prob'] > 0.15].copy()
-grid_map['geometry']  = grid_map.geometry.simplify(0.0008)
-grid_map['risk_pct']  = (grid_map['flood_prob'] * 100).round(1).astype(str) + "%"
-grid_map['area_name'] = grid_map['block_no'].apply(
-    lambda b: ", ".join(block_to_locs.get(b, [f"Grid Block {b}"]))
-)
-grid_map['cell_status'] = grid_map['block_no'].apply(
-    lambda b: "TEMPORARILY FLOODED (User Reported)"
-    if b in st.session_state.blocked_blocks else "Normal AI Assessment"
-)
-
-folium.Choropleth(
-    geo_data=json.loads(grid_map[['cell_id', 'geometry']].to_json()),
-    data=grid_map, columns=['cell_id', 'flood_prob'],
-    key_on='feature.properties.cell_id', fill_color='YlOrRd',
-    fill_opacity=0.40, line_opacity=0.10, legend_name='Predicted Flood Probability'
-).add_to(m)
-
-folium.GeoJson(
-    json.loads(grid_map[['cell_id', 'block_no', 'area_name', 'risk_pct', 'cell_status', 'geometry']].to_json()),
-    style_function=lambda x: {'fillColor': 'transparent', 'color': 'transparent', 'weight': 0},
-    tooltip=folium.GeoJsonTooltip(
-        fields=['block_no', 'area_name', 'risk_pct', 'cell_status'],
-        aliases=['Point / Block #:', 'Area / Landmark:', 'Predicted Flood Risk:', 'Status:']
+# 1. AI Flood Risk Zones Overlay
+if show_risk_zones:
+    grid_map              = grid_gdf[grid_gdf['flood_prob'] > 0.15].copy()
+    grid_map['geometry']  = grid_map.geometry.simplify(0.0008)
+    grid_map['risk_pct']  = (grid_map['flood_prob'] * 100).round(1).astype(str) + "%"
+    grid_map['area_name'] = grid_map['block_no'].apply(
+        lambda b: ", ".join(block_to_locs.get(b, [f"Grid Block {b}"]))
     )
-).add_to(m)
+    grid_map['cell_status'] = grid_map['block_no'].apply(
+        lambda b: "TEMPORARILY FLOODED (User Reported)"
+        if b in st.session_state.blocked_blocks else "Normal AI Assessment"
+    )
 
-if st.session_state.blocked_blocks:
+    folium.Choropleth(
+        geo_data=json.loads(grid_map[['cell_id', 'geometry']].to_json()),
+        data=grid_map, columns=['cell_id', 'flood_prob'],
+        key_on='feature.properties.cell_id', fill_color='YlOrRd',
+        fill_opacity=0.40, line_opacity=0.10, legend_name='Predicted Flood Probability',
+        name='🌊 AI Flood Risk Zones', show=True
+    ).add_to(m)
+
+    folium.GeoJson(
+        json.loads(grid_map[['cell_id', 'block_no', 'area_name', 'risk_pct', 'cell_status', 'geometry']].to_json()),
+        style_function=lambda x: {'fillColor': 'transparent', 'color': 'transparent', 'weight': 0},
+        tooltip=folium.GeoJsonTooltip(
+            fields=['block_no', 'area_name', 'risk_pct', 'cell_status'],
+            aliases=['Point / Block #:', 'Area / Landmark:', 'Predicted Flood Risk:', 'Status:']
+        ),
+        control=False
+    ).add_to(m)
+
+# 2. Blocked / Hazard Sectors Overlay
+if show_blocked and st.session_state.blocked_blocks:
     blocked_cells = grid_gdf[grid_gdf['block_no'].isin(st.session_state.blocked_blocks)].copy()
     if not blocked_cells.empty:
+        blocked_fg = folium.FeatureGroup(name="⛔ Reported Hazard Blocks", show=True)
         folium.GeoJson(
             json.loads(blocked_cells[['cell_id', 'block_no', 'geometry']].to_json()),
             style_function=lambda x: {
@@ -892,7 +953,7 @@ if st.session_state.blocked_blocks:
                 fields=['block_no'],
                 aliases=['TEMPORARILY FLOODED BLOCK #:']
             )
-        ).add_to(m)
+        ).add_to(blocked_fg)
 
         for _, row in blocked_cells.iterrows():
             b_id      = int(row['block_no'])
@@ -907,32 +968,77 @@ if st.session_state.blocked_blocks:
                     </div>
                 '''),
                 tooltip=f"Real-Time Flooded Square #{b_id} (All Roads Impassable)"
-            ).add_to(m)
+            ).add_to(blocked_fg)
+        blocked_fg.add_to(m)
 
-landmark_fg = folium.FeatureGroup(name="Landmark Point Numbers", show=True)
-for loc_name, (lat, lon) in LOCATIONS.items():
-    b_num = loc_to_block.get(loc_name)
-    if b_num and b_num not in st.session_state.blocked_blocks:
-        folium.Marker(
-            [lat, lon],
-            icon=folium.DivIcon(html=f'''
-                <div style="background: rgba(15, 23, 42, 0.85); color: #F8FAFC; padding: 2px 5px; border-radius: 4px; font-size: 10px; font-weight: 600; border: 1px solid #475569; text-align: center; white-space: nowrap; transform: translate(-50%, -50%);">
-                    {loc_name} <span style="color: #38BDF8; font-weight: 700;">#{b_num}</span>
-                </div>
-            '''),
-            tooltip=f"{loc_name} (Point / Block #{b_num})"
-        ).add_to(landmark_fg)
-landmark_fg.add_to(m)
+# 3. Node Points / Landmarks Overlay
+if show_landmarks:
+    landmark_fg = folium.FeatureGroup(name="📍 Landmark Node Points", show=True)
+    for loc_name, (lat, lon) in LOCATIONS.items():
+        b_num = loc_to_block.get(loc_name)
+        if b_num and b_num not in st.session_state.blocked_blocks:
+            folium.Marker(
+                [lat, lon],
+                icon=folium.DivIcon(html=f'''
+                    <div style="background: rgba(15, 23, 42, 0.85); color: #F8FAFC; padding: 2px 5px; border-radius: 4px; font-size: 10px; font-weight: 600; border: 1px solid #475569; text-align: center; white-space: nowrap; transform: translate(-50%, -50%);">
+                        {loc_name} <span style="color: #38BDF8; font-weight: 700;">#{b_num}</span>
+                    </div>
+                '''),
+                tooltip=f"{loc_name} (Point / Block #{b_num})"
+            ).add_to(landmark_fg)
+    landmark_fg.add_to(m)
 
+# 4. Institutions & Shelters Overlay
+if show_institutions and all_institutions_gdf is not None and not all_institutions_gdf.empty:
+    institutions_fg = folium.FeatureGroup(name="🏫 Key Institutions & Shelters", show=True)
+    for _, row in all_institutions_gdf.iterrows():
+        lat = float(row.geometry.y)
+        lon = float(row.geometry.x)
+        b_num = int(row.get('block_no', -1))
+        f_prob = float(row.get('flood_prob', 0.0))
+        is_blocked = b_num in st.session_state.blocked_blocks
+        is_safe = (f_prob <= 0.05) and not is_blocked
+
+        color = "#10b981" if is_safe else ("#ef4444" if is_blocked else "#f59e0b")
+        status_txt = "Designated Safe Shelter" if is_safe else ("Flooded Sector" if is_blocked else f"Risk: {f_prob*100:.1f}%")
+        
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=6,
+            color=color,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.85,
+            weight=1.5,
+            tooltip=f"🏫 {row['name']} ({str(row.get('amenity', 'Facility')).title()}) — Block #{b_num} — {status_txt}"
+        ).add_to(institutions_fg)
+    institutions_fg.add_to(m)
+
+# 5. Historical Flood Hotspots Overlay
+if show_hotspots and hotspots_gdf is not None and not hotspots_gdf.empty:
+    hotspots_fg = folium.FeatureGroup(name="⚠️ Historical Flood Hotspots", show=True)
+    valid_hotspots = hotspots_gdf[['Name', 'geometry']].dropna(subset=['geometry'])
+    folium.GeoJson(
+        json.loads(valid_hotspots.to_json()),
+        marker=folium.CircleMarker(
+            radius=3.5, color='#d97706', fill=True, fill_color='#fbbf24',
+            fill_opacity=0.65, weight=1
+        ),
+        tooltip=folium.GeoJsonTooltip(fields=['Name'], aliases=['Recorded Hotspot:'])
+    ).add_to(hotspots_fg)
+    hotspots_fg.add_to(m)
+
+# 6. Computed Route & Waypoints Overlay
 if route_coords:
+    route_fg = folium.FeatureGroup(name="🛣️ Navigation Route", show=True)
     route_color = "green" if (route_type == "Lower-Risk Path" or "Evacuation" in routing_mode) else "blue"
-    folium.PolyLine(route_coords, color=route_color, weight=6, opacity=0.85).add_to(m)
+    folium.PolyLine(route_coords, color=route_color, weight=6, opacity=0.85).add_to(route_fg)
     if start_loc in LOCATIONS:
         folium.Marker(
             LOCATIONS[start_loc],
             tooltip=f"Start: {start_loc} (Block #{loc_to_block.get(start_loc)})",
             icon=folium.Icon(color="gray", icon="play")
-        ).add_to(m)
+        ).add_to(route_fg)
     if actual_end_lat is not None:
         icon_color  = "green" if "Evacuation" in routing_mode else "red"
         icon_type   = "info-sign" if "Evacuation" in routing_mode else "flag"
@@ -942,9 +1048,10 @@ if route_coords:
             else f"Destination: {end_loc} (Block #{loc_to_block.get(end_loc)})"
         )
         folium.Marker([actual_end_lat, actual_end_lon], tooltip=tooltip_txt,
-                      icon=folium.Icon(color=icon_color, icon=icon_type)).add_to(m)
+                      icon=folium.Icon(color=icon_color, icon=icon_type)).add_to(route_fg)
+    route_fg.add_to(m)
 
-folium.LayerControl(position="topright").add_to(m)
+folium.LayerControl(position="topright", collapsed=True).add_to(m)
 st_folium(m, width="100%", height=560, returned_objects=[])
 
 
