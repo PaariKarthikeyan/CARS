@@ -22,6 +22,7 @@ env/
 *.aux.xml
 *.ovr
 *.lock
+CARS-main/
 
 # Local application and tool state
 .streamlit/secrets.toml
