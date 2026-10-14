@@ -1,4 +1,4 @@
-# Chennai Flood Risk and Road Accessibility Predictor
+# Chennai Accessibility and Road Seeker
 
 A geospatial machine-learning system for predicting flood-prone areas in Chennai and identifying roads that may have increased accessibility risk during heavy rainfall.
 
